@@ -23,6 +23,12 @@ type InputField struct {
 	// The text that was entered.
 	text string
 
+	// The location of the cursor relative to the end.
+	cursorOffset int
+
+	// The current vertical scroll location.
+	scroll int
+
 	// The text to be displayed before the input area.
 	label string
 
@@ -86,6 +92,7 @@ func (i *InputField) SetText(text string) *InputField {
 	if i.changed != nil {
 		i.changed(text)
 	}
+	i.constrainCursor()
 	return i
 }
 
@@ -244,23 +251,18 @@ func (i *InputField) Draw(screen tcell.Screen) {
 		screen.SetContent(x+index, y, ' ', nil, fieldStyle)
 	}
 
-	// Draw placeholder text.
 	text := i.text
 	if text == "" && i.placeholder != "" {
+		// Draw placeholder text.
 		Print(screen, i.placeholder, x, y, fieldWidth, AlignLeft, i.placeholderTextColor)
-	} else {
+	} else if text != "" {
 		// Draw entered text.
 		if i.maskCharacter > 0 {
 			text = strings.Repeat(string(i.maskCharacter), utf8.RuneCountInString(i.text))
 		} else {
 			text = Escape(text)
 		}
-		fieldWidth-- // We need one cell for the cursor.
-		if fieldWidth < runewidth.StringWidth(text) {
-			Print(screen, text, x, y, fieldWidth, AlignRight, i.fieldTextColor)
-		} else {
-			Print(screen, text, x, y, fieldWidth, AlignLeft, i.fieldTextColor)
-		}
+		Print(screen, text[i.scroll:], x, y, fieldWidth, AlignLeft, i.fieldTextColor)
 	}
 
 	// Set cursor.
@@ -279,19 +281,17 @@ func (i *InputField) setCursor(screen tcell.Screen) {
 		y++
 		rightLimit -= 2
 	}
-	fieldWidth := runewidth.StringWidth(i.text)
-	if i.fieldWidth > 0 && fieldWidth > i.fieldWidth-1 {
-		fieldWidth = i.fieldWidth - 1
-	}
 	if i.labelWidth > 0 {
-		x += i.labelWidth + fieldWidth
+		x += i.labelWidth
 	} else {
-		x += StringWidth(i.label) + fieldWidth
+		x += StringWidth(i.label)
 	}
 	if x >= rightLimit {
 		x = rightLimit - 1
 	}
-	screen.ShowCursor(x, y)
+
+	offset := runewidth.StringWidth(i.text) - i.scroll + i.cursorOffset
+	screen.ShowCursor(x+offset, y)
 }
 
 // InputHandler returns the handler for this primitive.
@@ -300,6 +300,7 @@ func (i *InputField) InputHandler() func(event *tcell.EventKey, setFocus func(p 
 		// Trigger changed events.
 		currentText := i.text
 		defer func() {
+			i.constrainCursor()
 			if i.text != currentText && i.changed != nil {
 				i.changed(i.text)
 			}
@@ -308,24 +309,45 @@ func (i *InputField) InputHandler() func(event *tcell.EventKey, setFocus func(p 
 		// Process key event.
 		switch key := event.Key(); key {
 		case tcell.KeyRune: // Regular character.
-			newText := i.text + string(event.Rune())
+			index := len(i.text) + i.cursorOffset
+			newText := i.text[:index] + string(event.Rune()) + i.text[index:]
 			if i.accept != nil {
 				if !i.accept(newText, event.Rune()) {
 					break
 				}
 			}
 			i.text = newText
+		case tcell.KeyLeft:
+			i.cursorOffset--
+		case tcell.KeyRight:
+			i.cursorOffset++
+		case tcell.KeyHome:
+			i.cursorOffset = -runewidth.StringWidth(i.text)
+		case tcell.KeyEnd:
+			i.cursorOffset = 0
 		case tcell.KeyCtrlU: // Delete all.
 			i.text = ""
 		case tcell.KeyCtrlW: // Delete last word.
 			lastWord := regexp.MustCompile(`\s*\S+\s*$`)
 			i.text = lastWord.ReplaceAllString(i.text, "")
 		case tcell.KeyBackspace, tcell.KeyBackspace2: // Delete last character.
-			if len(i.text) == 0 {
+			runes := []rune(i.text)
+			index := len(runes) + i.cursorOffset
+			if index <= 0 {
+				break
+			}
+			runes = append(runes[:index-1], runes[index:]...)
+			i.text = string(runes)
+			i.scroll--
+		case tcell.KeyDelete: // Delete the next character
+			if i.cursorOffset == 0 {
 				break
 			}
 			runes := []rune(i.text)
-			i.text = string(runes[:len(runes)-1])
+			index := len(runes) + i.cursorOffset
+			runes = append(runes[:index], runes[index+1:]...)
+			i.text = string(runes)
+			i.cursorOffset++
 		case tcell.KeyEnter, tcell.KeyTab, tcell.KeyBacktab, tcell.KeyEscape: // We're done.
 			if i.done != nil {
 				i.done(key)
@@ -335,4 +357,35 @@ func (i *InputField) InputHandler() func(event *tcell.EventKey, setFocus func(p 
 			}
 		}
 	})
+}
+
+func (i *InputField) constrainCursor() {
+	width := runewidth.StringWidth(i.text)
+	index := width + i.cursorOffset
+	if index < 0 {
+		i.cursorOffset = -width
+	} else if i.cursorOffset > 0 {
+		i.cursorOffset = 0
+	}
+
+	index = width + i.cursorOffset
+	fieldWidth := i.fieldWidth
+	if fieldWidth == 0 {
+		labelWidth := i.labelWidth
+		if labelWidth == 0 {
+			labelWidth = runewidth.StringWidth(i.label)
+		}
+		fieldWidth = i.Box.width - labelWidth
+	}
+	if index > i.scroll+fieldWidth-1 {
+		i.scroll = index - fieldWidth + 1
+	} else if index < i.scroll {
+		i.scroll = index
+	}
+	if i.scroll < 0 {
+		i.scroll = 0
+	}
+	if i.scroll > width {
+		i.scroll = width
+	}
 }
